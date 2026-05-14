@@ -302,48 +302,44 @@ class Aggregator(nn.Module):
         # token merging R
         token_ratio = 0.4
         
-        # 1. VGGT-X Precision Wrapper: Force execution context into BFloat16 to drop memory usage
+        # 1. VGGT-X Optimization: Force mixed-precision execution 
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             
             for block_group in range(self.aa_block_num):
                 for aa_type in self.aa_order:
                     
                     if aa_type == "frame":
-                        # 2. VGGT-X Layer Pruning: Skip frame block execution if not in active tracking layers
+                        # 2. VGGT-X Layer Pruning: Jump indices forward if layer is skipped
                         if frame_idx not in used_intermediate_layer_idx and frame_idx < max(used_intermediate_layer_idx):
                             frame_idx += self.aa_block_size
                             continue
                         
-                        # Execute frame attention (local features)
                         for _ in range(self.aa_block_size):
                             tokens = self.frame_blocks[frame_idx](tokens)
                             frame_idx += 1
                             
                     elif aa_type == "global":
-                        # 2. VGGT-X Layer Pruning: Skip global block execution if not active
+                        # 2. VGGT-X Layer Pruning: Jump indices forward if layer is skipped
                         if global_idx not in used_intermediate_layer_idx and global_idx < max(used_intermediate_layer_idx):
                             global_idx += self.aa_block_size
                             continue
                         
-                        # 3. FastVGGT Token Merging Optimization: Apply right before calculating global attention matrices
+                        # 3. FastVGGT Token Merging Optimization: Apply right before global attention
                         if global_idx in used_intermediate_layer_idx:
-                            # Reduces spatial token sequence lengths by 40% dynamically
                             tokens = self.fast_token_merging(x=tokens, r=token_ratio)
                         
-                        # Execute global cross-attention (multi-view tracking)
                         for _ in range(self.aa_block_size):
                             tokens = self.global_blocks[global_idx](tokens)
                             
-                            # Cache the layer output if it is an active tracking index
+                            # Cache the exact integer layer key the original heads depend on
                             if global_idx in used_intermediate_layer_idx:
-                                # Convert back to standard Float32 to protect task head regression from positional drift
+                                # Cast back to float32 to prevent positional drift in the task heads
                                 output_list[global_idx] = tokens.to(torch.float32)
                                 
                             global_idx += 1
 
-        # Return the feature map cache dictionary and the index where patches begin
         return output_list, self.patch_start_idx
-#
+
 #        iter_obj = range(self.aa_block_num)
 #        if verbose:
 #            from tqdm import tqdm
