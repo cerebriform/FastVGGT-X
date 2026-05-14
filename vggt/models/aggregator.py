@@ -295,49 +295,98 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = {}
 
-        iter_obj = range(self.aa_block_num)
-        if verbose:
-            from tqdm import tqdm
-            iter_obj = tqdm(iter_obj, "Running attention")
-        for _ in iter_obj:
-            assert tokens.dtype == dtype
-            for attn_type in self.aa_order:
-                if attn_type == "frame":
-                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos, chunk_size=chunk_size
-                    )
-                elif attn_type == "global":
-                    tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
-                    )
-                else:
-                    raise ValueError(f"Unknown attention type: {attn_type}")
+        # only these layers are used by prediction heads, all others are unused
+        # P.S. camera head only uses layer 23 with patch idx 0
+        used_intermediate_layer_idx = [4, 11, 17, 23]
 
-                # torch.cuda.empty_cache()
+        # token merging R
+        token_ratio = 0.4
+        
+        # 1. VGGT-X Precision Wrapper: Force execution context into BFloat16 to drop memory usage
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            
+            for block_group in range(self.aa_block_num):
+                for aa_type in self.aa_order:
+                    
+                    if aa_type == "frame":
+                        # 2. VGGT-X Layer Pruning: Skip frame block execution if not in active tracking layers
+                        if frame_idx not in used_intermediate_layer_idx and frame_idx < max(used_intermediate_layer_idx):
+                            frame_idx += self.aa_block_size
+                            continue
+                        
+                        # Execute frame attention (local features)
+                        for _ in range(self.aa_block_size):
+                            tokens = self.frame_blocks[frame_idx](tokens)
+                            frame_idx += 1
+                            
+                    elif aa_type == "global":
+                        # 2. VGGT-X Layer Pruning: Skip global block execution if not active
+                        if global_idx not in used_intermediate_layer_idx and global_idx < max(used_intermediate_layer_idx):
+                            global_idx += self.aa_block_size
+                            continue
+                        
+                        # 3. FastVGGT Token Merging Optimization: Apply right before calculating global attention matrices
+                        if global_idx in used_intermediate_layer_idx:
+                            # Reduces spatial token sequence lengths by 40% dynamically
+                            tokens = self.fast_token_merging(tokens, r=0.4)
+                        
+                        # Execute global cross-attention (multi-view tracking)
+                        for _ in range(self.aa_block_size):
+                            tokens = self.global_blocks[global_idx](tokens)
+                            
+                            # Cache the layer output if it is an active tracking index
+                            if global_idx in used_intermediate_layer_idx:
+                                # Convert back to standard Float32 to protect task head regression from positional drift
+                                output_list[global_idx] = tokens.to(torch.float32)
+                                
+                            global_idx += 1
 
-            # only these layers are used by prediction heads, all others are unused
-            # P.S. camera head only uses layer 23 with patch idx 0
-            used_intermediate_layer_idx = [4, 11, 17, 23]
-            if _ not in used_intermediate_layer_idx:
-                continue
-
-            if True:
-                for i in range(len(frame_intermediates)):
-                    assert frame_intermediates[i].dtype == dtype
-                    assert global_intermediates[i].dtype == dtype
-                    # frame_intermediates[i] = frame_intermediates[i].to(dtype)
-                    # global_intermediates[i] = global_intermediates[i].to(dtype)
-
-            assert len(frame_intermediates) == 1
-            for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list[_] = concat_inter.cpu()
-
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+        # Return the feature map cache dictionary and the index where patches begin
         return output_list, self.patch_start_idx
+#
+#        iter_obj = range(self.aa_block_num)
+#        if verbose:
+#            from tqdm import tqdm
+#            iter_obj = tqdm(iter_obj, "Running attention")
+#        for _ in iter_obj:
+#            assert tokens.dtype == dtype
+#            for attn_type in self.aa_order:
+#                if attn_type == "frame":
+#                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+#                        tokens, B, S, P, C, frame_idx, pos=pos, chunk_size=chunk_size
+#                    )
+#                elif attn_type == "global":
+#                    tokens, global_idx, global_intermediates = self._process_global_attention(
+#                        tokens, B, S, P, C, global_idx, pos=pos
+#                    )
+#                else:
+#                    raise ValueError(f"Unknown attention type: {attn_type}")
+#
+#                # torch.cuda.empty_cache()
+#
+#            # only these layers are used by prediction heads, all others are unused
+#            # P.S. camera head only uses layer 23 with patch idx 0
+#            # used_intermediate_layer_idx = [4, 11, 17, 23]
+#            if _ not in used_intermediate_layer_idx:
+#                continue
+#
+#            if True:
+#                for i in range(len(frame_intermediates)):
+#                    assert frame_intermediates[i].dtype == dtype
+#                    assert global_intermediates[i].dtype == dtype
+#                    # frame_intermediates[i] = frame_intermediates[i].to(dtype)
+#                    # global_intermediates[i] = global_intermediates[i].to(dtype)
+#
+#            assert len(frame_intermediates) == 1
+#            for i in range(len(frame_intermediates)):
+#                # concat frame and global intermediates, [B x S x P x 2C]
+#                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+#                output_list[_] = concat_inter.cpu()
+#
+#        del concat_inter
+#        del frame_intermediates
+#        del global_intermediates
+#        return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, chunk_size=128):
         """
