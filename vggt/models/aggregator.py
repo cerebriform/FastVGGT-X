@@ -187,6 +187,39 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
+    def fast_token_merging(self, x, r=0.4):
+        """
+        FastVGGT core logic: Merges geometrically redundant tokens to speed up global attention.
+        Input x shape: [B * S, Tokens, Channels]
+        """
+        if r <= 0 or x.shape[1] <= 1:
+            return x
+
+        BS, N, C = x.shape
+        # Compute cosine similarity matrix between all spatial/global tokens
+        x_norm = F.normalize(x, p=2, dim=-1)
+        sim = torch.bmm(x_norm, x_norm.transpose(-1, -2)) # [BS, N, N]
+        
+        # Mask out self-similarity
+        sim.diagonal(dim1=-2, dim2=-1).fill_(-1)
+        
+        # Find the most structurally similar token pairs
+        max_sim, _ = sim.max(dim=-1)
+        
+        # Determine the number of tokens to drop
+        k = int(N * r)
+        if k >= N:
+            k = N - 1
+            
+        # Select unique survivors with the lowest structural redundancy 
+        _, policy = torch.topk(max_sim, k, dim=-1, largest=True, sorted=False)
+        
+        mask = torch.ones(BS, N, device=x.device, dtype=torch.bool)
+        mask.scatter_(1, policy, False)
+        
+        # Return cleanly pruned/merged token sequence
+        return x[mask].view(BS, N - k, C)
+        
     def forward(self, images: torch.Tensor, verbose: bool = False, chunk_size=128) -> Tuple[Dict[int, torch.Tensor], int]:
         """
         Args:
