@@ -328,7 +328,7 @@ class Aggregator(nn.Module):
                         # 3. FastVGGT Token Merging Optimization: Apply right before calculating global attention matrices
                         if global_idx in used_intermediate_layer_idx:
                             # Reduces spatial token sequence lengths by 40% dynamically
-                            tokens = self.fast_token_merging(tokens, r=0.4)
+                            tokens = self.fast_token_merging(x=tokens, r=token_ratio)
                         
                         # Execute global cross-attention (multi-view tracking)
                         for _ in range(self.aa_block_size):
